@@ -505,13 +505,67 @@ async def main(limit, headless):
     print(f"\nSaved {saved} this run. {n} total in {DB_PATH}. Run with --export for a CSV.")
 
 
+async def debug_comments(url, headless):
+    """Open one auction and report how its comments load. Reads only; saves nothing."""
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=headless)
+        page = await browser.new_page()
+
+        async def on_response(resp):
+            if "/comments" not in resp.url or "carsandbids.com" not in resp.url:
+                return
+            try:
+                data = await resp.json()
+            except Exception:
+                return
+            ents = data.get("comments_and_bids") or [] if isinstance(data, dict) else []
+            types = {t: [e.get("type") for e in ents].count(t) for t in (1, 2, 5)}
+            q = parse_qs(urlparse(resp.url).query)
+            q = {k: v for k, v in q.items() if k not in ("timestamp", "signature")}
+            extra = [k for k in data if k != "comments_and_bids"] if isinstance(data, dict) else []
+            print(f"  COMMENTS REQUEST params={q} -> {len(ents)} entries {types} keys={extra}")
+
+        page.on("response", on_response)
+
+        async def controls(label):
+            texts = await page.eval_on_selector_all(
+                "button, a, [role=tab], [role=button]",
+                "els => els.filter(e => e.offsetParent !== null)"
+                ".map(e => (e.innerText || '').trim().replace(/\\s+/g, ' '))"
+                ".filter(t => t && t.length < 40)")
+            hits = sorted({t for t in texts if re.search(
+                r"comment|bid|more|load|show|view|repl|all|newest|oldest|top", t, re.I)})
+            print(f"\n[{label}] visible controls mentioning comments/bids/more:")
+            for t in hits:
+                print(f"   - {t!r}")
+
+        print(f"Opening {url}")
+        await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+        await asyncio.sleep(6)
+        if looks_like_challenge(await page.title(), await page.inner_text("body")):
+            print("Bot check page. Stopping.")
+            return
+        await controls("after load")
+        print("\nScrolling to the bottom a few times...")
+        for _ in range(6):
+            await page.mouse.wheel(0, 4000)
+            await asyncio.sleep(2)
+        await controls("after scrolling")
+        await asyncio.sleep(2)
+        await browser.close()
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--headless", action="store_true")
     ap.add_argument("--limit", type=int, default=MAX_LISTINGS)
     ap.add_argument("--export", action="store_true", help="write auctions.csv and exit")
+    ap.add_argument("--debug-comments", metavar="AUCTION_URL",
+                    help="report how comments load on one auction, then exit")
     args = ap.parse_args()
-    if args.export:
+    if args.debug_comments:
+        asyncio.run(debug_comments(args.debug_comments, args.headless))
+    elif args.export:
         export_csv(open_db())
     else:
         asyncio.run(main(args.limit, args.headless))
