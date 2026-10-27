@@ -27,7 +27,9 @@ Run
  python cab_bmw_scraper.py                  # visible browser, up to 250 listings
  python cab_bmw_scraper.py --limit 10       # small test run first
  python cab_bmw_scraper.py --headless
- python cab_bmw_scraper.py --export         # write auctions.csv from the DB, no scraping
+ python cab_bmw_scraper.py --export         # write auctions/bids/comments CSVs, no scraping
+ python cab_bmw_scraper.py --recheck-incomplete   # revisit only cars missing comments
+ python cab_bmw_scraper.py --debug-comments URL   # show how one auction's comments load
 """
 
 import argparse
@@ -258,7 +260,18 @@ def find_comment_list(data):
 
 
 # ---------------------------------------------------------------- scraper
-async def main(limit, headless):
+def incomplete_auctions(db):
+    """Saved auctions with more than one comment missing: (id, url, list item, comments)."""
+    out = []
+    for aid, url, lj, dj, cj in db.execute(
+            "SELECT id, url, list_json, detail_json, comments_json FROM auctions"):
+        want = dig(json.loads(dj or "{}"), "stats", "comments") or 0
+        if len(entries_by_type(cj)[1]) < want - 1:
+            out.append((aid, url, json.loads(lj or "{}"), json.loads(cj or "[]")))
+    return out
+
+
+async def main(limit, headless, recheck=False):
     db = open_db()
     done = {r[0] for r in db.execute("SELECT id FROM auctions UNION SELECT id FROM skipped")}
     print(f"{len(done)} auctions already in the database will be skipped.")
@@ -362,25 +375,46 @@ async def main(limit, headless):
                 await click_load_more()
 
         async def click_load_more():
+            """Click "Load more comments" until it disappears. Records why it stopped early."""
+            misses = 0
             for _ in range(MAX_LOAD_MORE):
                 btn = visible("Load more")  # "Load more comments" in the default view
                 if not await btn.count():
-                    break
+                    return  # button gone: everything loaded
                 n = len(state["comments"])
                 try:
-                    await btn.click(timeout=3000)
-                except Exception:
-                    break
-                if not await wait_for(lambda: len(state["comments"]) > n, 8):
-                    break
+                    await btn.scroll_into_view_if_needed(timeout=3000)
+                    await btn.click(timeout=5000)
+                except Exception as e:
+                    # Something (a sticky bar, a toast) may cover the button; fire the
+                    # button's own click handler instead.
+                    try:
+                        await btn.dispatch_event("click")
+                    except Exception:
+                        state["note"] = f"load-more click failed ({type(e).__name__})"
+                        return
+                if not await wait_for(lambda: len(state["comments"]) > n, 12):
+                    misses += 1
+                    if misses >= 2:
+                        state["note"] = "load-more clicked twice, no new comments arrived"
+                        return
+                    continue
+                misses = 0
                 check_blocked()
                 await asyncio.sleep(0.7)
+            state["note"] = f"stopped at MAX_LOAD_MORE ({MAX_LOAD_MORE})"
 
-        async def scrape_auction(aid, url, item):
+        async def scrape_auction(aid, url, item, previous=None):
             state["detail"].clear()
             state["comments"].clear()
+            state["note"] = None
+            if previous:  # recheck: keep what an earlier run already captured
+                state["comments"].extend(previous)
+            n_before = len(state["comments"])
             await auction_page.goto(url, wait_until="domcontentloaded", timeout=45_000)
             got = await wait_for(lambda: bool(state["detail"]), 20)
+            # Let the first comments response land before clicking anything.
+            await wait_for(lambda: len(state["comments"]) > n_before, 8)
             await check_page(auction_page)
             if not got:
                 return "skip", "detail JSON never arrived"
@@ -401,6 +435,8 @@ async def main(limit, headless):
                 await load_history(want_bids, want_comments)
             bids, comments = captured()
             completeness = f"bids {bids}/{want_bids}, comments {comments}/{want_comments}"
+            if comments < want_comments - 1 and state["note"]:
+                completeness += f" [{state['note']}]"
 
             db.execute("INSERT OR REPLACE INTO auctions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (
                 aid, url, item.get("title"),
@@ -417,6 +453,17 @@ async def main(limit, headless):
         # list paging
         saved = 0
         try:
+            if recheck:
+                todo = incomplete_auctions(db)
+                print(f"{len(todo)} saved auctions are missing comments. Rechecking them.")
+                for i, (aid, url, item, prev) in enumerate(todo[:limit], 1):
+                    if not robots.can_fetch("*", url):
+                        continue
+                    await polite_sleep()
+                    result, note = await scrape_auction(aid, url, item, previous=prev)
+                    print(f"  [{i}/{min(len(todo), limit)}] {item.get('title')} ({note})")
+                return
+
             if not robots.can_fetch("*", START_URL):
                 print("robots.txt disallows the start URL. Stopping.")
                 return
@@ -561,6 +608,8 @@ if __name__ == "__main__":
     ap.add_argument("--headless", action="store_true")
     ap.add_argument("--limit", type=int, default=MAX_LISTINGS)
     ap.add_argument("--export", action="store_true", help="write auctions.csv and exit")
+    ap.add_argument("--recheck-incomplete", action="store_true",
+                    help="revisit only saved auctions that are missing comments")
     ap.add_argument("--debug-comments", metavar="AUCTION_URL",
                     help="report how comments load on one auction, then exit")
     args = ap.parse_args()
@@ -569,4 +618,4 @@ if __name__ == "__main__":
     elif args.export:
         export_csv(open_db())
     else:
-        asyncio.run(main(args.limit, args.headless))
+        asyncio.run(main(args.limit, args.headless, args.recheck_incomplete))
