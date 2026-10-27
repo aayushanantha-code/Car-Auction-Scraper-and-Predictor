@@ -51,7 +51,7 @@ START_URL = f"{BASE}/past-auctions/"  # ?q= search isn't honored; the title filt
 MAX_LISTINGS = 250            # qualifying auctions saved per run
 MAX_LIST_PAGES = 150          # safety stop on list paging (~10% of auctions qualify)
 DELAY_RANGE = (3.0, 5.0)      # seconds between page loads
-LOAD_FULL_HISTORY = True      # click "Bid History" + "Load more" for every bid
+LOAD_FULL_HISTORY = True      # click "Load more comments" until every bid and comment loads
 MAX_LOAD_MORE = 25            # cap on "Load more" clicks per view, per auction
 M_CARS_ONLY = False           # True = only M cars (M2-M8, 1M, M Coupe)
 DB_PATH = Path("cab_bmw.sqlite")
@@ -336,9 +336,15 @@ async def main(limit, headless):
             types = [e.get("type") for e in ents.values()]
             return types.count(2), types.count(1)
 
+        def visible(text):
+            # Pages keep hidden duplicates of some controls, so only match visible ones.
+            return auction_page.locator(
+                f'button:has-text("{text}"):visible, a:has-text("{text}"):visible,'
+                f' [role="tab"]:has-text("{text}"):visible,'
+                f' [role="button"]:has-text("{text}"):visible').first
+
         async def click_tab(name):
-            tab = auction_page.locator(f'button:has-text("{name}"), a:has-text("{name}"),'
-                                       f' [role="tab"]:has-text("{name}")').first
+            tab = visible(name)
             if await tab.count():
                 n = len(state["comments"])
                 try:
@@ -348,22 +354,17 @@ async def main(limit, headless):
                     pass
 
         async def load_history(want_bids, want_comments):
-            # The default view mixes comments and bids, so loading it fully gets both.
+            # The default view ("Newest") mixes comments and bids, so loading it fully
+            # gets both. Don't click "Seller Comments": it filters to the seller only.
             await click_load_more()
-            bids, comments = captured()
-            # Fall back to the dedicated tabs for anything still missing.
-            if bids < want_bids:
+            if captured()[0] < want_bids:
                 await click_tab("Bid History")
-                await click_load_more()
-            if captured()[1] < want_comments:
-                await click_tab("Comments")
                 await click_load_more()
 
         async def click_load_more():
             for _ in range(MAX_LOAD_MORE):
-                btn = auction_page.locator('button:has-text("Load more"),'
-                                           ' a:has-text("Load more")').first
-                if not await btn.count() or not await btn.is_visible():
+                btn = visible("Load more")  # "Load more comments" in the default view
+                if not await btn.count():
                     break
                 n = len(state["comments"])
                 try:
